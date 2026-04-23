@@ -8,10 +8,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
-import torch
-import torch.nn as nn
 import yfinance as yf
 from stable_baselines3 import PPO
+from tensorflow.keras.models import load_model
 
 warnings.filterwarnings("ignore")
 
@@ -20,7 +19,7 @@ st.set_page_config(page_title="Nishe FX Portfolio App", layout="wide")
 # =========================================================
 # CONFIG
 # =========================================================
-PPO_MODEL_PATH = "ppo_fx_final_model_sharpe.zip"
+PPO_MODEL_PATH = "ppo_fx_final_model_sharpe.zip"  # or folder name if you saved differently
 DATASET_PATH = "dataset_step2_features.csv"
 LSTM_BUNDLE_ZIP = "lstm_fx_models_bundle.zip"
 LSTM_DIR = "lstm_fx_models"
@@ -58,42 +57,15 @@ RATE_DIFF_COLS = {
 }
 
 # =========================================================
-# PYTORCH MODEL
-# =========================================================
-class FXLSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size=64, num_layers=2, dropout=0.2):
-        super().__init__()
-
-        effective_dropout = dropout if num_layers > 1 else 0.0
-
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=effective_dropout,
-        )
-        self.fc = nn.Linear(hidden_size, 1)
-
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        out = out[:, -1, :]
-        out = self.fc(out)
-        return out
-
-
-# =========================================================
 # UTILS
 # =========================================================
 def ensure_lstm_bundle_extracted(zip_path: str = LSTM_BUNDLE_ZIP, extract_dir: str = LSTM_DIR):
     if os.path.isdir(extract_dir):
         return
-
     if not os.path.exists(zip_path):
         raise FileNotFoundError(
             f"Could not find {zip_path}. Put your downloaded LSTM bundle in the project root."
         )
-
     with zipfile.ZipFile(zip_path, "r") as zf:
         zf.extractall(".")
 
@@ -106,13 +78,9 @@ def _get_close_from_download(df: pd.DataFrame, ticker: str) -> pd.Series:
         if ("Close", ticker) in df.columns:
             s = df[("Close", ticker)].copy()
         else:
-            close_block = df.get("Close")
-            if isinstance(close_block, pd.DataFrame):
-                s = close_block.iloc[:, 0].copy()
-            else:
-                s = pd.Series(dtype=float)
+            s = df["Close"].iloc[:, 0].copy()
     else:
-        s = df["Close"].copy() if "Close" in df.columns else pd.Series(dtype=float)
+        s = df["Close"].copy()
 
     s = pd.to_numeric(s, errors="coerce").dropna()
     s.name = "close"
@@ -167,37 +135,16 @@ def load_lstm_assets():
     metadata = {}
 
     for ccy in CURRENCY_CONFIG.keys():
-        model_path = os.path.join(LSTM_DIR, f"{ccy}_lstm_fx.pth")
+        model_path = os.path.join(LSTM_DIR, f"{ccy}_lstm_fx.keras")
         scaler_path = os.path.join(LSTM_DIR, f"{ccy}_scaler.pkl")
         meta_path = os.path.join(LSTM_DIR, f"{ccy}_metadata.json")
 
-        if os.path.exists(meta_path):
-            metadata[ccy] = pd.read_json(meta_path, typ="series").to_dict()
-
+        if os.path.exists(model_path):
+            models[ccy] = load_model(model_path)
         if os.path.exists(scaler_path):
             scalers[ccy] = joblib.load(scaler_path)
-
-        if os.path.exists(model_path):
-            if ccy not in metadata:
-                raise ValueError(f"Missing metadata for {ccy}. Expected {meta_path}")
-
-            input_size = int(metadata[ccy]["input_size"])
-            hidden_size = int(metadata[ccy].get("hidden_size", 64))
-            num_layers = int(metadata[ccy].get("num_layers", 2))
-            dropout = float(metadata[ccy].get("dropout", 0.2))
-
-            model = FXLSTMModel(
-                input_size=input_size,
-                hidden_size=hidden_size,
-                num_layers=num_layers,
-                dropout=dropout,
-            )
-
-            state_dict = torch.load(model_path, map_location=torch.device("cpu"))
-            model.load_state_dict(state_dict)
-            model.eval()
-
-            models[ccy] = model
+        if os.path.exists(meta_path):
+            metadata[ccy] = pd.read_json(meta_path, typ="series").to_dict()
 
     return models, scalers, metadata
 
@@ -206,6 +153,10 @@ def load_lstm_assets():
 # DATA PREP FOR LSTM
 # =========================================================
 def build_lstm_feature_frame_from_close(close: pd.Series) -> pd.DataFrame:
+    """
+    This matches the LSTM training feature engineering.
+    The training code used these exact fields before sequence creation.
+    """
     df = pd.DataFrame(index=close.index)
     df["close"] = pd.to_numeric(close, errors="coerce")
     df["log_close"] = np.log(df["close"])
@@ -228,7 +179,7 @@ def build_lstm_feature_frame_from_close(close: pd.Series) -> pd.DataFrame:
     df["price_vs_ma63"] = df["close"] / df["ma_63"] - 1.0
     df["ma21_vs_ma63"] = df["ma_21"] / df["ma_63"] - 1.0
 
-    df = df.replace([np.inf, -np.inf], np.nan).dropna().copy()
+    df = df.dropna().copy()
     return df
 
 
@@ -252,23 +203,19 @@ def get_latest_live_rates() -> dict:
     return latest
 
 
-def prepare_lstm_input_for_currency(ccy: str, scenario_spot: float | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+def prepare_lstm_input_for_currency(ccy: str, scenario_spot: float | None = None) -> tuple[np.ndarray, pd.DataFrame]:
     close = download_fx_history(CURRENCY_CONFIG[ccy]["ticker"], period="25y").copy()
-
     if len(close) < LOOKBACK + 130:
-        raise ValueError(
-            f"Not enough history for {ccy} to create a {LOOKBACK}-day LSTM input window."
-        )
+        raise ValueError(f"Not enough history for {ccy} to create a {LOOKBACK}-day LSTM input window.")
 
+    # For scenario testing, overwrite only the latest spot.
+    # This is an approximation, but it is the cleanest way to let the user stress the current level.
     if scenario_spot is not None and np.isfinite(scenario_spot):
         close.iloc[-1] = float(scenario_spot)
 
     feat_df = build_lstm_feature_frame_from_close(close)
-
     if len(feat_df) < LOOKBACK:
-        raise ValueError(
-            f"Not enough engineered feature rows for {ccy} after rolling calculations."
-        )
+        raise ValueError(f"Not enough engineered feature rows for {ccy} after rolling calculations.")
 
     return feat_df.iloc[-LOOKBACK:].copy(), feat_df
 
@@ -282,12 +229,10 @@ def predict_fx_return_1m(ccy: str, scenario_spot: float | None = None) -> float:
     model = LSTM_MODELS[ccy]
 
     x = seq_df.values.astype(np.float32)
-    x_scaled = scaler.transform(x).astype(np.float32)
-    x_tensor = torch.tensor(x_scaled, dtype=torch.float32).unsqueeze(0)
+    x_scaled = scaler.transform(x)
+    x_scaled = x_scaled.reshape(1, x_scaled.shape[0], x_scaled.shape[1])
 
-    with torch.no_grad():
-        pred = model(x_tensor).cpu().numpy().flatten()[0]
-
+    pred = model.predict(x_scaled, verbose=0).flatten()[0]
     return float(pred)
 
 
@@ -307,22 +252,23 @@ def get_live_predicted_fx_vector(scenario_spots: dict | None = None) -> np.ndarr
 def get_state_from_row(row: pd.Series, prev_weights: np.ndarray | None = None) -> np.ndarray:
     if prev_weights is None:
         prev_weights = np.zeros(len(ACTIVE_CURRENCIES), dtype=np.float32)
-
     feature_values = row[STATE_FEATURES].values.astype(np.float32)
     obs = np.concatenate([feature_values, prev_weights]).astype(np.float32)
     return obs
 
 
 def build_current_row(base_dataset: pd.DataFrame, live_fx: dict) -> pd.Series:
+    """
+    Start from the latest dataset row, then overwrite any FX spot fields that also exist in PPO features.
+    Rate differentials stay as the latest dataset values unless user changes them in scenario mode.
+    """
     row = base_dataset.iloc[-1].copy()
-
     for ccy, live_val in live_fx.items():
         if not np.isfinite(live_val):
             continue
         for col in FX_FEATURE_MAP.get(ccy, []):
             if col in row.index:
                 row[col] = live_val
-
     return row
 
 
@@ -362,12 +308,14 @@ def compute_portfolio_metrics(weights: np.ndarray, row: pd.Series, scenario_spot
     carry_contribution = float(np.dot(weights, carry))
     total_return = fx_contribution + carry_contribution
 
+    # Approximate risk from the latest 12 monthly-equivalent states using the latest LSTM prediction framework.
+    # Since LSTM is live and forward-looking, we estimate expected-return dispersion using recent PPO rows.
     hist_returns = []
     tail_df = DATASET.tail(VOL_LOOKBACK_MONTHS)
 
     for _, hist_row in tail_df.iterrows():
         hist_carry = get_carry_vector_from_row(hist_row)
-        hist_pred_fx = pred_fx
+        hist_pred_fx = pred_fx  # keep the same current prediction set for expected-return-based risk proxy
         hist_returns.append(float(np.dot(weights, hist_pred_fx + hist_carry)))
 
     hist_returns = np.array(hist_returns, dtype=float)
@@ -414,12 +362,7 @@ def make_market_inputs_table(live_fx: dict, row: pd.Series) -> pd.DataFrame:
 # =========================================================
 ensure_lstm_bundle_extracted()
 DATASET = load_dataset()
-
-ACTIVE_CURRENCIES = [
-    ccy for ccy in CURRENCY_CONFIG.keys()
-    if f"{ccy}_target" in DATASET.columns or any(c in DATASET.columns for c in FX_FEATURE_MAP[ccy])
-]
-
+ACTIVE_CURRENCIES = [ccy for ccy in CURRENCY_CONFIG.keys() if f"{ccy}_target" in DATASET.columns or any(c in DATASET.columns for c in FX_FEATURE_MAP[ccy])]
 STATE_FEATURES = [col for col in DATASET.columns if not col.endswith("_target")]
 STATE_FEATURES = [col for col in STATE_FEATURES if pd.api.types.is_numeric_dtype(DATASET[col])]
 
@@ -429,9 +372,9 @@ LSTM_MODELS, LSTM_SCALERS, LSTM_METADATA = load_lstm_assets()
 # =========================================================
 # UI
 # =========================================================
-st.title("FX Portfolio Optimization using PPO + PyTorch LSTM")
+st.title("FX Portfolio Optimization using PPO + LSTM")
 st.caption(
-    "PyTorch LSTM predicts next 1-month FX returns from the latest 180 trading days. "
+    "LSTM predicts next 1-month FX returns from the latest 180 trading days. "
     "PPO then chooses the long/short currency allocation."
 )
 
@@ -447,6 +390,7 @@ live_fx = get_latest_live_rates()
 current_row = build_current_row(DATASET, live_fx)
 timestamp_label = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+# Tabs
 current_tab, scenario_tab = st.tabs(["Current Optimal Portfolio", "Scenario Simulation"])
 
 # =========================================================
@@ -543,7 +487,6 @@ with scenario_tab:
         scenario_obs = get_state_from_row(scenario_row)
         scenario_action, _ = PPO_MODEL.predict(scenario_obs, deterministic=True)
         scenario_weights = action_to_weights(scenario_action)
-
         scenario_metrics = compute_portfolio_metrics(
             scenario_weights,
             scenario_row,
@@ -592,7 +535,7 @@ with scenario_tab:
 # =========================================================
 st.markdown("---")
 st.write(
-    "Forecast engine: PyTorch LSTM | Allocation engine: PPO | "
+    "Forecast engine: LSTM | Allocation engine: PPO | "
     "Return definition: predicted FX change + carry | "
     "Constraint: self-financing (weights sum to zero)"
 )
