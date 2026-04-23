@@ -1,3 +1,4 @@
+import re
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -54,20 +55,6 @@ FX_TICKERS = {
     "CNY": "CNY=X"
 }
 
-# Absolute interest rate columns in your dataset
-ABS_RATE_COLS = {
-    "EUR": "EUR_rate",
-    "GBP": "GBP_rate",
-    "AUD": "AUD_rate",
-    "JPY": "JPY_rate",
-    "INR": "INR_rate",
-    "CNY": "CNY_rate"
-}
-
-# US rate column used to derive carry / rate differentials
-US_RATE_CANDIDATES = ["USD_rate", "US_rate", "Fed_rate", "policy_rate_us"]
-
-# Spot / FX feature candidates to update in current and simulation tabs
 FX_FEATURE_CANDIDATES = {
     "EUR": ["EUR_spot", "EUR_fx", "EUR_close", "EURUSD", "EUR_price"],
     "GBP": ["GBP_spot", "GBP_fx", "GBP_close", "GBPUSD", "GBP_price"],
@@ -77,34 +64,10 @@ FX_FEATURE_CANDIDATES = {
     "CNY": ["CNY_spot", "CNY_fx", "CNY_close", "CNYUSD", "CNY_price"],
 }
 
-# Derived / alternate columns often found in feature sets
-RATE_DIFF_CANDIDATE_TEMPLATE = [
-    "{c}_rate_diff",
-    "{c}_carry",
-    "{c}_rate_spread"
-]
-
-FX_CHANGE_CANDIDATE_TEMPLATE = [
-    "{c}_spot_change",
-    "{c}_fx_change",
-    "{c}_return_1m",
-    "{c}_mom_1m"
-]
 
 # =========================================================
-# 3. HELPERS
+# 3. GENERIC HELPERS
 # =========================================================
-def find_first_existing_column(candidates, row_index):
-    for c in candidates:
-        if c in row_index:
-            return c
-    return None
-
-
-def get_us_rate_col(row: pd.Series):
-    return find_first_existing_column(US_RATE_CANDIDATES, row.index)
-
-
 def safe_float(x, default=0.0):
     try:
         if pd.isna(x):
@@ -114,10 +77,174 @@ def safe_float(x, default=0.0):
         return default
 
 
+def normalize_col(col: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", col.lower())
+
+
+def is_rate_col(col: str) -> bool:
+    c = col.lower()
+    return "rate" in c or "yield" in c or "policy" in c or "interest" in c
+
+
+def is_diff_like(col: str) -> bool:
+    c = col.lower()
+    return ("diff" in c) or ("spread" in c) or ("carry" in c)
+
+
+def is_usd_like(col: str) -> bool:
+    c = col.lower()
+    return ("usd" in c) or ("us_" in c) or c.startswith("us") or ("fed" in c)
+
+
+def find_first_existing(candidates, columns):
+    for c in candidates:
+        if c in columns:
+            return c
+    return None
+
+
+# =========================================================
+# 4. RATE COLUMN DISCOVERY
+# =========================================================
+def discover_rate_structure(columns):
+    """
+    Auto-detect:
+    - USD/base rate column
+    - local absolute rate columns
+    - rate differential columns
+    """
+    cols = list(columns)
+
+    usd_candidates = []
+    for col in cols:
+        cl = col.lower()
+        if is_rate_col(col) and not is_diff_like(col) and is_usd_like(col):
+            score = 0
+            if "usd" in cl:
+                score += 5
+            if "rate" in cl:
+                score += 3
+            if "policy" in cl:
+                score += 2
+            if "yield" in cl:
+                score += 1
+            usd_candidates.append((score, col))
+
+    usd_rate_col = max(usd_candidates, default=(None, None))[1]
+
+    local_abs_cols = {}
+    diff_cols = {}
+
+    for ccy in CURRENCIES:
+        abs_candidates = []
+        diff_candidates = []
+
+        for col in cols:
+            cl = col.lower()
+
+            if ccy.lower() not in cl:
+                continue
+
+            if not is_rate_col(col):
+                continue
+
+            if is_diff_like(col):
+                score = 0
+                if "rate" in cl:
+                    score += 3
+                if "diff" in cl:
+                    score += 4
+                if "spread" in cl:
+                    score += 2
+                if "carry" in cl:
+                    score += 1
+                diff_candidates.append((score, col))
+            else:
+                score = 0
+                if "rate" in cl:
+                    score += 4
+                if "policy" in cl:
+                    score += 2
+                if "yield" in cl:
+                    score += 1
+                abs_candidates.append((score, col))
+
+        local_abs_cols[ccy] = max(abs_candidates, default=(None, None))[1]
+        diff_cols[ccy] = max(diff_candidates, default=(None, None))[1]
+
+    return {
+        "usd_rate_col": usd_rate_col,
+        "local_abs_cols": local_abs_cols,
+        "diff_cols": diff_cols,
+    }
+
+
+RATE_INFO = discover_rate_structure(dataset.columns)
+
+
+# =========================================================
+# 5. FX / RATE ACCESSORS
+# =========================================================
+def get_fx_vector(row: pd.Series) -> np.ndarray:
+    fx_vec = []
+    for c in CURRENCIES:
+        target_col = f"{c}_target"
+        fx_vec.append(safe_float(row[target_col], 0.0) if target_col in row.index else 0.0)
+    return np.array(fx_vec, dtype=np.float32)
+
+
+def get_usd_rate(row: pd.Series) -> float:
+    usd_col = RATE_INFO["usd_rate_col"]
+    if usd_col and usd_col in row.index:
+        return safe_float(row[usd_col], 0.0)
+    return 0.0
+
+
+def get_absolute_rate_for_currency(row: pd.Series, ccy: str) -> float:
+    """
+    Priority:
+    1. use explicit local absolute rate col if present
+    2. else derive from USD/base + diff
+    3. else 0
+    """
+    local_abs_col = RATE_INFO["local_abs_cols"].get(ccy)
+    diff_col = RATE_INFO["diff_cols"].get(ccy)
+
+    if local_abs_col and local_abs_col in row.index and pd.notna(row[local_abs_col]):
+        return safe_float(row[local_abs_col], 0.0)
+
+    usd_rate = get_usd_rate(row)
+
+    if diff_col and diff_col in row.index and pd.notna(row[diff_col]):
+        return usd_rate + safe_float(row[diff_col], 0.0)
+
+    return 0.0
+
+
+def get_absolute_rate_dict(row: pd.Series) -> dict:
+    return {c: get_absolute_rate_for_currency(row, c) for c in CURRENCIES}
+
+
+def get_carry_vector(row: pd.Series) -> np.ndarray:
+    """
+    Monthly carry from absolute local rate - absolute USD/base rate.
+    """
+    usd_rate = get_usd_rate(row)
+    carry_vec = []
+
+    for c in CURRENCIES:
+        local_rate = get_absolute_rate_for_currency(row, c)
+        carry_annual = (local_rate - usd_rate) / 100.0
+        carry_monthly = carry_annual / 12.0
+        carry_vec.append(carry_monthly)
+
+    return np.array(carry_vec, dtype=np.float32)
+
+
+# =========================================================
+# 6. ACTION / STATE / METRICS
+# =========================================================
 def action_to_weights(action: np.ndarray, position_limit: float = 0.9) -> np.ndarray:
-    """
-    Convert raw PPO action into a bounded zero-sum portfolio.
-    """
     weights = np.asarray(action, dtype=np.float64).flatten()
     weights = np.clip(weights, -1.0, 1.0) * position_limit
 
@@ -127,13 +254,10 @@ def action_to_weights(action: np.ndarray, position_limit: float = 0.9) -> np.nda
 
     weights = weights - weights.mean()
 
-    # tiny cleanup so displayed sum is effectively zero
     if len(weights) > 0:
         weights[-1] = -weights[:-1].sum()
 
     weights = np.clip(weights, -position_limit, position_limit)
-
-    # one final recenter
     weights = weights - weights.mean()
 
     return weights.astype(np.float32)
@@ -148,35 +272,6 @@ def get_state_from_row(row: pd.Series, prev_weights: np.ndarray | None = None) -
     return obs
 
 
-def get_carry_vector(row: pd.Series) -> np.ndarray:
-    """
-    Carry is derived internally from absolute local rate - absolute USD rate.
-    Monthly carry = annual differential / 12.
-    """
-    carry_vec = []
-
-    us_rate_col = get_us_rate_col(row)
-    us_rate = safe_float(row[us_rate_col], 0.0) if us_rate_col else 0.0
-
-    for c in CURRENCIES:
-        local_col = ABS_RATE_COLS.get(c)
-        local_rate = safe_float(row[local_col], 0.0) if local_col in row.index else 0.0
-
-        carry_annual = (local_rate - us_rate) / 100.0
-        carry_monthly = carry_annual / 12.0
-        carry_vec.append(carry_monthly)
-
-    return np.array(carry_vec, dtype=np.float32)
-
-
-def get_fx_vector(row: pd.Series) -> np.ndarray:
-    fx_vec = []
-    for c in CURRENCIES:
-        col = f"{c}_target"
-        fx_vec.append(safe_float(row[col], 0.0) if col in row.index else 0.0)
-    return np.array(fx_vec, dtype=np.float32)
-
-
 def compute_portfolio_metrics(weights: np.ndarray, row: pd.Series):
     fx_vec = get_fx_vector(row)
     carry_vec = get_carry_vector(row)
@@ -185,7 +280,6 @@ def compute_portfolio_metrics(weights: np.ndarray, row: pd.Series):
     carry_contribution = float(np.dot(weights, carry_vec))
     total_return = fx_contribution + carry_contribution
 
-    # Historical risk using trailing 12 observations from dataset
     returns_hist = []
     tail_df = dataset.tail(12)
 
@@ -215,21 +309,14 @@ def compute_portfolio_metrics(weights: np.ndarray, row: pd.Series):
 def make_weights_table(weights: np.ndarray, row: pd.Series) -> pd.DataFrame:
     fx_vec = get_fx_vector(row)
     carry_vec = get_carry_vector(row)
-
-    abs_rates = []
-    us_rate_col = get_us_rate_col(row)
-    us_rate = safe_float(row[us_rate_col], 0.0) if us_rate_col else 0.0
-
-    for c in CURRENCIES:
-        local_col = ABS_RATE_COLS.get(c)
-        local_rate = safe_float(row[local_col], 0.0) if local_col in row.index else np.nan
-        abs_rates.append(local_rate)
+    abs_rates = get_absolute_rate_dict(row)
+    usd_rate = get_usd_rate(row)
 
     df = pd.DataFrame({
         "Currency": CURRENCIES,
         "Weight": weights,
-        "Absolute Rate (%)": abs_rates,
-        "USD Rate (%)": us_rate,
+        "Absolute Rate (%)": [abs_rates[c] for c in CURRENCIES],
+        "USD Rate (%)": [usd_rate] * len(CURRENCIES),
         "FX_1M": fx_vec,
         "Carry_1M": carry_vec,
         "Total_Asset_1M": fx_vec + carry_vec
@@ -239,6 +326,18 @@ def make_weights_table(weights: np.ndarray, row: pd.Series) -> pd.DataFrame:
     return df.sort_values("Weight", ascending=False).reset_index(drop=True)
 
 
+def run_model_on_row(row: pd.Series):
+    obs = get_state_from_row(row)
+    action, _ = model.predict(obs, deterministic=True)
+    weights = action_to_weights(action, position_limit=POSITION_LIMIT)
+    metrics = compute_portfolio_metrics(weights, row)
+    weights_df = make_weights_table(weights, row)
+    return obs, weights, metrics, weights_df
+
+
+# =========================================================
+# 7. LIVE FX + FEATURE UPDATES
+# =========================================================
 @st.cache_data(ttl=3600)
 def fetch_live_fx_rates():
     rates = {}
@@ -278,33 +377,39 @@ def update_fx_features_in_row(row: pd.Series, fx_inputs: dict) -> pd.Series:
     return row
 
 
-def update_rate_features_in_row(row: pd.Series, rate_inputs: dict) -> pd.Series:
+def update_rate_features_in_row(row: pd.Series, scenario_abs_rates: dict) -> pd.Series:
+    """
+    Updates whichever rate features actually exist in the dataset:
+    - local absolute rate col if present
+    - rate differential col if present, derived from local abs - USD/base
+    """
     row = row.copy()
+    usd_rate = get_usd_rate(row)
 
-    us_rate_col = get_us_rate_col(row)
-    us_rate = safe_float(row[us_rate_col], 0.0) if us_rate_col else 0.0
+    for c in CURRENCIES:
+        local_rate = float(scenario_abs_rates[c])
 
-    for c, val in rate_inputs.items():
-        # absolute local rate
-        local_col = ABS_RATE_COLS.get(c)
-        if local_col in row.index:
-            row[local_col] = val
+        local_abs_col = RATE_INFO["local_abs_cols"].get(c)
+        diff_col = RATE_INFO["diff_cols"].get(c)
 
-        # derived rate differential / carry style columns if they exist
-        for template in RATE_DIFF_CANDIDATE_TEMPLATE:
-            col = template.format(c=c)
-            if col in row.index:
-                row[col] = val - us_rate
+        if local_abs_col and local_abs_col in row.index:
+            row[local_abs_col] = local_rate
+
+        if diff_col and diff_col in row.index:
+            row[diff_col] = local_rate - usd_rate
 
     return row
 
 
 def update_fx_change_features(base_row: pd.Series, scenario_row: pd.Series, scenario_fx: dict) -> pd.Series:
-    """
-    Recomputes a few common change/momentum style features if they exist.
-    This helps ensure the PPO observation actually changes.
-    """
     row = scenario_row.copy()
+
+    change_templates = [
+        "{c}_spot_change",
+        "{c}_fx_change",
+        "{c}_return_1m",
+        "{c}_mom_1m",
+    ]
 
     for c, new_fx in scenario_fx.items():
         base_spot = None
@@ -319,7 +424,7 @@ def update_fx_change_features(base_row: pd.Series, scenario_row: pd.Series, scen
 
         pct_change = (new_fx / base_spot) - 1.0
 
-        for template in FX_CHANGE_CANDIDATE_TEMPLATE:
+        for template in change_templates:
             col = template.format(c=c)
             if col in row.index:
                 row[col] = pct_change
@@ -328,48 +433,38 @@ def update_fx_change_features(base_row: pd.Series, scenario_row: pd.Series, scen
 
 
 def build_today_row():
-    """
-    Uses latest dataset row as base state and updates live FX values
-    into matching feature columns if present.
-    """
     row = dataset.iloc[-1].copy()
     live_fx = fetch_live_fx_rates()
-
     row = update_fx_features_in_row(row, live_fx)
-
     return row, live_fx
 
 
-def apply_scenario_to_row(base_row: pd.Series, scenario_fx: dict, scenario_rates: dict) -> pd.Series:
+def apply_scenario_to_row(base_row: pd.Series, scenario_fx: dict, scenario_abs_rates: dict) -> pd.Series:
     row = base_row.copy()
     row = update_fx_features_in_row(row, scenario_fx)
-    row = update_rate_features_in_row(row, scenario_rates)
+    row = update_rate_features_in_row(row, scenario_abs_rates)
     row = update_fx_change_features(base_row, row, scenario_fx)
     return row
 
 
+# =========================================================
+# 8. DISPLAY HELPERS
+# =========================================================
 def show_input_table(live_fx, row):
-    abs_rates = []
-    for c in CURRENCIES:
-        rate_col = ABS_RATE_COLS.get(c)
-        abs_rates.append(row[rate_col] if rate_col in row.index else np.nan)
+    abs_rates = get_absolute_rate_dict(row)
 
     input_df = pd.DataFrame({
         "Currency": CURRENCIES,
         "Current FX Rate": [live_fx.get(c, np.nan) for c in CURRENCIES],
-        "Absolute Interest Rate (%)": abs_rates
+        "Absolute Interest Rate (%)": [abs_rates[c] for c in CURRENCIES]
     })
-
     st.dataframe(input_df, use_container_width=True)
 
-
-def run_model_on_row(row: pd.Series):
-    obs = get_state_from_row(row)
-    action, _ = model.predict(obs, deterministic=True)
-    weights = action_to_weights(action, position_limit=POSITION_LIMIT)
-    metrics = compute_portfolio_metrics(weights, row)
-    weights_df = make_weights_table(weights, row)
-    return obs, weights, metrics, weights_df
+    usd_col = RATE_INFO["usd_rate_col"]
+    if usd_col:
+        st.caption(f"Base/USD rate column detected: {usd_col}")
+    else:
+        st.caption("No explicit USD/base rate column detected. Absolute rates may depend only on available local rate columns.")
 
 
 def plot_weights(df: pd.DataFrame, title: str):
@@ -382,21 +477,21 @@ def plot_weights(df: pd.DataFrame, title: str):
 
 
 # =========================================================
-# 4. TITLE
+# 9. TITLE
 # =========================================================
 st.title("FX Portfolio Optimization using PPO")
-st.caption("PPO-based FX allocation using 1M FX change + carry, with Sharpe-oriented training.")
+st.caption("PPO-based FX allocation using FX change + carry, with Sharpe-oriented training.")
 
 today_row, live_fx = build_today_row()
 today_label = datetime.now().strftime("%Y-%m-%d %H:%M")
 
 # =========================================================
-# 5. TABS
+# 10. TABS
 # =========================================================
 tab1, tab2 = st.tabs(["Current Optimal Portfolio", "Scenario Simulation"])
 
 # =========================================================
-# 6. TAB 1 - CURRENT PORTFOLIO
+# 11. TAB 1 - CURRENT PORTFOLIO
 # =========================================================
 with tab1:
     st.subheader("Current PPO Portfolio")
@@ -423,19 +518,19 @@ with tab1:
     plot_weights(weights_df, "Current PPO Portfolio Weights")
 
 # =========================================================
-# 7. TAB 2 - SCENARIO SIMULATION
+# 12. TAB 2 - SCENARIO SIMULATION
 # =========================================================
 with tab2:
     st.subheader("Scenario Simulation")
-    st.write("Adjust current FX rates and absolute local interest rates, then run the scenario.")
+    st.write("Adjust FX rates and absolute local interest rates, then run the scenario.")
 
-    scenario_row = today_row.copy()
+    base_abs_rates = get_absolute_rate_dict(today_row)
 
     st.markdown("### Adjust Inputs")
     sim_cols = st.columns(2)
 
     scenario_fx = {}
-    scenario_rates = {}
+    scenario_abs_rates = {}
 
     with sim_cols[0]:
         st.markdown("#### FX Rates")
@@ -452,9 +547,8 @@ with tab2:
     with sim_cols[1]:
         st.markdown("#### Absolute Interest Rates (%)")
         for c in CURRENCIES:
-            rate_col = ABS_RATE_COLS.get(c)
-            default_rate = safe_float(scenario_row[rate_col], 0.0) if rate_col in scenario_row.index else 0.0
-            scenario_rates[c] = st.number_input(
+            default_rate = safe_float(base_abs_rates.get(c, 0.0), 0.0)
+            scenario_abs_rates[c] = st.number_input(
                 f"{c} Interest Rate (%)",
                 value=default_rate,
                 step=0.10,
@@ -465,10 +559,10 @@ with tab2:
     run_sim = st.button("Run Simulation", type="primary")
 
     if run_sim:
-        scenario_row = apply_scenario_to_row(today_row, scenario_fx, scenario_rates)
+        scenario_row = apply_scenario_to_row(today_row, scenario_fx, scenario_abs_rates)
 
-        current_obs = get_state_from_row(today_row)
         sim_obs, sim_weights, sim_metrics, sim_weights_df = run_model_on_row(scenario_row)
+        current_obs = get_state_from_row(today_row)
 
         st.markdown("### Simulated Portfolio Output")
 
@@ -491,28 +585,24 @@ with tab2:
         debug_df = pd.DataFrame({
             "Metric": [
                 "Observation shift vs current",
-                "Max absolute obs difference",
-                "Current weight sum",
-                "Scenario weight sum"
+                "Max absolute observation difference"
             ],
             "Value": [
                 float(np.abs(sim_obs - current_obs).sum()),
-                float(np.max(np.abs(sim_obs - current_obs))),
-                float(weights.sum()) if "weights" in locals() else 0.0,
-                float(sim_weights.sum())
+                float(np.max(np.abs(sim_obs - current_obs)))
             ]
         })
         st.dataframe(debug_df, use_container_width=True)
 
         st.caption(
-            "If observation shift stays near zero after changing scenario inputs, "
-            "the features being edited in the UI are not the main features used by the trained PPO model."
+            "If the observation shift is still tiny after changing rates, "
+            "the trained PPO policy likely depends more on other features than the rate fields alone."
         )
     else:
         st.info("Adjust the inputs and click Run Simulation.")
 
 # =========================================================
-# 8. FOOTER
+# 13. FOOTER
 # =========================================================
 st.markdown("---")
-st.write("Model: PPO | Return definition: FX change + carry | Deployment mode: live input + scenario inference")
+st.write("Model: PPO | Return definition: FX change + carry | Deployment mode: live input + inference")
