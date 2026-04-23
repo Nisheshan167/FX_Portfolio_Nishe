@@ -6,9 +6,47 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 import yfinance as yf
-from pandas_datareader import data as pdr
 from stable_baselines3 import PPO
+import requests
 
+@st.cache_data(ttl=3600)
+def fetch_fred_history(start_date, end_date):
+    out = {}
+
+    for name, series_id in FRED_RATE_SERIES.items():
+        try:
+            url = f"https://api.stlouisfed.org/fred/series/observations"
+
+            params = {
+                "series_id": series_id,
+                "api_key": st.secrets["FRED_API_KEY"],
+                "file_type": "json",
+                "observation_start": start_date,
+                "observation_end": end_date
+            }
+
+            response = requests.get(url, params=params)
+            data = response.json()
+
+            observations = data.get("observations", [])
+
+            dates = []
+            values = []
+
+            for obs in observations:
+                val = obs["value"]
+                if val == ".":
+                    continue
+                dates.append(obs["date"])
+                values.append(float(val))
+
+            series = pd.Series(values, index=pd.to_datetime(dates))
+            out[name] = series
+
+        except Exception:
+            out[name] = pd.Series(dtype=float)
+
+    return out
 st.set_page_config(page_title="Nishe FX PPO Portfolio", layout="wide")
 
 # =========================================================
