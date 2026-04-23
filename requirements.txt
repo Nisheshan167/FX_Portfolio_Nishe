@@ -8,3 +8,5 @@ stable-baselines3
 streamlit
 openpyxl
 pandas-datareader
+tensorflow-cpu
+joblib
