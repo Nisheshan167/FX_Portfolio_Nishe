@@ -7,3 +7,4 @@ gymnasium
 stable-baselines3
 streamlit
 openpyxl
+pandas_datareader
