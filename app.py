@@ -65,11 +65,20 @@ RATE_DIFF_COLS = {
 # 3. HELPERS
 # =========================================================
 def action_to_weights(action: np.ndarray, position_limit: float = 0.9) -> np.ndarray:
-    weights = np.clip(action, -1.0, 1.0).astype(np.float32)
+    weights = np.clip(action, -1.0, 1.0).astype(np.float64)
+
+    # scale to position limit
     weights = weights * position_limit
+
+    # iterative projection: zero-sum + bounds
+    for _ in range(50):
+        weights = weights - weights.mean()
+        weights = np.clip(weights, -position_limit, position_limit)
+
+    # final exact centering
     weights = weights - weights.mean()
-    weights = np.clip(weights, -position_limit, position_limit)
-    return weights
+
+    return weights.astype(np.float32)
 
 def get_state_from_row(row: pd.Series, prev_weights: np.ndarray | None = None) -> np.ndarray:
     if prev_weights is None:
