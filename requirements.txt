@@ -9,4 +9,3 @@ streamlit
 openpyxl
 joblib
 torch
-tensorflow
