@@ -3,6 +3,7 @@ import zipfile
 import warnings
 from datetime import datetime
 import joblib
+import tensorflow
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
