@@ -67,6 +67,7 @@ RATE_DIFF_COLS = {
 }
 
 CHECKPOINT_EXTS = {".pt", ".pth", ".bin"}
+KERAS_EXTS = {".keras", ".h5"}
 SCALER_EXTS = {".pkl", ".joblib"}
 METADATA_EXTS = {".json"}
 
@@ -115,6 +116,10 @@ def find_first_matching_file(base_dir: Path, currency: str, exts: set[str]):
         return None
     candidates = sorted(candidates, key=lambda x: (len(str(x)), str(x)))
     return candidates[0]
+
+
+def list_bundle_files(base_dir: Path):
+    return sorted([str(p.relative_to(base_dir)) for p in base_dir.rglob("*") if p.is_file()])
 
 
 def load_json_file(path: Path):
@@ -229,6 +234,17 @@ def load_lstm_assets():
     extract_zip_if_needed(LSTM_BUNDLE_ZIP, LSTM_EXTRACT_DIR)
 
     assets = {}
+    debug = {
+        "bundle_files": list_bundle_files(LSTM_EXTRACT_DIR),
+        "loaded_currencies": [],
+        "missing_checkpoint": [],
+        "keras_like_files": [],
+        "errors": {},
+    }
+
+    for p in LSTM_EXTRACT_DIR.rglob("*"):
+        if p.is_file() and p.suffix.lower() in KERAS_EXTS:
+            debug["keras_like_files"].append(str(p.relative_to(LSTM_EXTRACT_DIR)))
 
     for ccy in CURRENCY_CONFIG.keys():
         ckpt_path = find_first_matching_file(LSTM_EXTRACT_DIR, ccy, CHECKPOINT_EXTS)
@@ -236,35 +252,38 @@ def load_lstm_assets():
         meta_path = find_first_matching_file(LSTM_EXTRACT_DIR, ccy, METADATA_EXTS)
 
         if ckpt_path is None:
+            debug["missing_checkpoint"].append(ccy)
             continue
 
-        metadata = load_json_file(meta_path)
-        loaded_obj = torch.load(ckpt_path, map_location=DEVICE)
+        try:
+            metadata = load_json_file(meta_path)
+            loaded_obj = torch.load(ckpt_path, map_location=DEVICE)
 
-        if isinstance(loaded_obj, nn.Module):
-            model = loaded_obj.to(DEVICE)
-            model.eval()
-        elif isinstance(loaded_obj, dict):
-            model = _build_model_from_checkpoint_dict(loaded_obj, metadata)
-        else:
-            raise ValueError(
-                f"Unsupported checkpoint type for {ccy}: {type(loaded_obj)}"
-            )
+            if isinstance(loaded_obj, nn.Module):
+                model = loaded_obj.to(DEVICE)
+                model.eval()
+            elif isinstance(loaded_obj, dict):
+                model = _build_model_from_checkpoint_dict(loaded_obj, metadata)
+            else:
+                raise ValueError(f"Unsupported checkpoint type: {type(loaded_obj)}")
 
-        scaler = None
-        if scaler_path is not None:
-            scaler = joblib.load(scaler_path)
+            scaler = None
+            if scaler_path is not None:
+                scaler = joblib.load(scaler_path)
 
-        assets[ccy] = {
-            "model": model,
-            "scaler": scaler,
-            "metadata": metadata,
-            "checkpoint_path": str(ckpt_path),
-            "scaler_path": str(scaler_path) if scaler_path else None,
-            "meta_path": str(meta_path) if meta_path else None,
-        }
+            assets[ccy] = {
+                "model": model,
+                "scaler": scaler,
+                "metadata": metadata,
+                "checkpoint_path": str(ckpt_path),
+                "scaler_path": str(scaler_path) if scaler_path else None,
+                "meta_path": str(meta_path) if meta_path else None,
+            }
+            debug["loaded_currencies"].append(ccy)
+        except Exception as e:
+            debug["errors"][ccy] = str(e)
 
-    return assets
+    return assets, debug
 
 # =========================================================
 # MARKET DATA
@@ -422,15 +441,18 @@ def get_live_predicted_fx_vector(active_currencies: list[str], assets: dict, sce
 # =========================================================
 # PPO STATE HELPERS
 # =========================================================
-def get_active_currencies(dataset: pd.DataFrame, lstm_assets: dict) -> list[str]:
-    out = []
+def get_active_currencies(dataset: pd.DataFrame, lstm_assets: dict) -> tuple[list[str], list[str]]:
+    active = []
+    dataset_currencies = []
     for ccy in CURRENCY_CONFIG.keys():
         dataset_has_currency = (
             f"{ccy}_target" in dataset.columns or any(col in dataset.columns for col in FX_FEATURE_MAP[ccy])
         )
+        if dataset_has_currency:
+            dataset_currencies.append(ccy)
         if dataset_has_currency and ccy in lstm_assets:
-            out.append(ccy)
-    return out
+            active.append(ccy)
+    return active, dataset_currencies
 
 
 def build_state_features(dataset: pd.DataFrame) -> list[str]:
@@ -598,19 +620,27 @@ def plot_return_decomposition(metrics: dict, title: str):
 # =========================================================
 # INIT
 # =========================================================
-try:
-    DATASET = load_dataset()
+try:    DATASET = load_dataset()
     PPO_MODEL = load_ppo_model()
-    LSTM_ASSETS = load_lstm_assets()
+    LSTM_ASSETS, LSTM_DEBUG = load_lstm_assets()
 except Exception as e:
     st.error(f"Startup failed: {e}")
     st.stop()
 
-ACTIVE_CURRENCIES = get_active_currencies(DATASET, LSTM_ASSETS)
+ACTIVE_CURRENCIES, DATASET_CURRENCIES = get_active_currencies(DATASET, LSTM_ASSETS)
 STATE_FEATURES = build_state_features(DATASET)
 
 if not ACTIVE_CURRENCIES:
-    st.error("No currencies could be activated. Check the dataset and LSTM bundle file names.")
+    st.error("No currencies could be activated.")
+    st.write("Currencies found in dataset:", DATASET_CURRENCIES)
+    st.write("Currencies with loadable PyTorch LSTM checkpoints:", list(LSTM_ASSETS.keys()))
+    if LSTM_DEBUG.get("keras_like_files"):
+        st.warning("Your LSTM bundle appears to contain Keras/TensorFlow model files, not PyTorch checkpoints.")
+        st.write("Keras-like files found:", LSTM_DEBUG["keras_like_files"])
+    if LSTM_DEBUG.get("bundle_files"):
+        st.write("Files found inside LSTM bundle:", LSTM_DEBUG["bundle_files"])
+    if LSTM_DEBUG.get("errors"):
+        st.write("Checkpoint load errors:", LSTM_DEBUG["errors"])
     st.stop()
 
 # =========================================================
@@ -624,7 +654,8 @@ st.caption(
 with st.sidebar:
     st.header("Model Settings")
     st.write(f"Device: {DEVICE}")
-    st.write(f"Active currencies: {', '.join(ACTIVE_CURRENCIES)}")
+    st.write(f"Currencies found in dataset: {', '.join(DATASET_CURRENCIES) if DATASET_CURRENCIES else 'None'}")
+    st.write(f"Currencies with loadable PyTorch LSTMs: {', '.join(ACTIVE_CURRENCIES) if ACTIVE_CURRENCIES else 'None'}")
     st.write(f"LSTM lookback window: {LOOKBACK} trading days")
     st.write(f"Forecast horizon: {HORIZON_TRADING_DAYS} trading days (~1 month)")
     st.write(f"Position limit per currency: {POSITION_LIMIT:.0%}")
