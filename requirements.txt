@@ -4,9 +4,9 @@ matplotlib
 yfinance
 scikit-learn
 gymnasium
+tensorflow
 stable-baselines3
 streamlit
 openpyxl
 pandas-datareader
 joblib
-tensorflow-cpu==2.15.0
