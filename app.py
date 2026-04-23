@@ -626,6 +626,9 @@ try:    DATASET = load_dataset()
 except Exception as e:
     st.error(f"Startup failed: {e}")
     st.stop()
+except Exception as e:
+    st.error(f"Startup failed: {e}")
+    st.stop()
 
 ACTIVE_CURRENCIES, DATASET_CURRENCIES = get_active_currencies(DATASET, LSTM_ASSETS)
 STATE_FEATURES = build_state_features(DATASET)
