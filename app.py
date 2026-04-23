@@ -620,12 +620,10 @@ def plot_return_decomposition(metrics: dict, title: str):
 # =========================================================
 # INIT
 # =========================================================
-try:    DATASET = load_dataset()
+try:
+    DATASET = load_dataset()
     PPO_MODEL = load_ppo_model()
     LSTM_ASSETS, LSTM_DEBUG = load_lstm_assets()
-except Exception as e:
-    st.error(f"Startup failed: {e}")
-    st.stop()
 except Exception as e:
     st.error(f"Startup failed: {e}")
     st.stop()
