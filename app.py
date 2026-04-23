@@ -2,7 +2,7 @@ import os
 import zipfile
 import warnings
 from datetime import datetime
-import tensorflow
+import tensorflow as tf
 import joblib
 import matplotlib.pyplot as plt
 import numpy as np
