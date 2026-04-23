@@ -10,3 +10,4 @@ openpyxl
 pandas-datareader
 tensorflow-cpu
 joblib
+tensorflow
