@@ -203,12 +203,15 @@ def predict_lstm_return(currency, features, models, scalers):
 # FINANCE FUNCTIONS
 # =====================================================
 
-def calculate_carry_return(foreign_rate):
+def calculate_carry_return(foreign_rate, usd_rate):
     """
-    Monthly carry earned by holding that currency.
-    PPO weight sign decides whether we invest or borrow.
+    Monthly carry based on interest rate differential.
+
+    This MUST match PPO training.
     """
-    return foreign_rate / 12
+    annual_rate_diff = foreign_rate - usd_rate
+    monthly_carry = annual_rate_diff / 12
+    return annual_rate_diff, monthly_carry
 
 
 def build_forecast_table(usd_rate, foreign_rates, lstm_models, lstm_scalers):
@@ -230,7 +233,7 @@ def build_forecast_table(usd_rate, foreign_rates, lstm_models, lstm_scalers):
         momentum_21d = float(features["mom_21"].iloc[-1])
 
         annual_rate_diff = foreign_rates[currency] - usd_rate
-        carry_return = foreign_rates[currency] / 12
+        carry_return = annual_rate_diff / 12
         expected_total_return = predicted_fx_return + carry_return
 
         rows.append({
