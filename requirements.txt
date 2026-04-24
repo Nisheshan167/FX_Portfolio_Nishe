@@ -1,9 +1,9 @@
 streamlit
 pandas
-numpy
+numpy==2.0.2
 matplotlib
 yfinance
-tensorflow==2.16.2
+tensorflow==2.18.1
 stable-baselines3
 gymnasium
 joblib
