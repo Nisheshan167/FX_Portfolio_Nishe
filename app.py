@@ -231,6 +231,7 @@ def build_forecast_table(usd_rate, foreign_rates, lstm_models, lstm_scalers):
 
         annual_rate_diff = foreign_rates[currency] - usd_rate
         carry_return = foreign_rates[currency] / 12
+        expected_total_return = predicted_fx_return + carry_return
 
         rows.append({
             "Currency": currency,
