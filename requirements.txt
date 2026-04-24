@@ -3,7 +3,7 @@ pandas
 numpy
 matplotlib
 yfinance
-tensorflow
+tensorflow==2.16.2
 stable-baselines3
 gymnasium
 joblib
