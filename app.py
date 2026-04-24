@@ -229,8 +229,8 @@ def build_forecast_table(usd_rate, foreign_rates, lstm_models, lstm_scalers):
         volatility_21d = float(features["vol_21"].iloc[-1])
         momentum_21d = float(features["mom_21"].iloc[-1])
 
-        carry_return = calculate_carry_return(foreign_rates[currency])
-        expected_total_return = predicted_fx_return + carry_return
+        annual_rate_diff = foreign_rates[currency] - usd_rate
+        carry_return = foreign_rates[currency] / 12
 
         rows.append({
             "Currency": currency,
