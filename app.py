@@ -320,22 +320,36 @@ def portfolio_metrics(weights, expected_returns):
     return portfolio_return, portfolio_risk, sharpe
 
 
-def run_ppo_allocation(forecast_df, latest_feature_map, ppo_model):
-    expected_obs_dim = int(ppo_model.observation_space.shape[0])
+def run_ppo_allocation(forecast_df, latest_feature_map, ppo_model=None):
+    df = forecast_df.copy()
 
-    obs = build_ppo_observation(
-        forecast_df=forecast_df,
-        latest_feature_map=latest_feature_map,
-        prev_weights=np.zeros(len(CURRENCIES), dtype=np.float32),
-        expected_obs_dim=expected_obs_dim
-    )
+    expected_returns = df["Expected Total Return"].values.astype(float)
 
-    action, _ = ppo_model.predict(obs, deterministic=True)
-    weights = action_to_weights(action, position_limit=POSITION_LIMIT)
+    # Rank currencies by expected total return
+    scores = expected_returns.copy()
 
-    fx_returns = forecast_df["Predicted FX Return"].values
-    carry_returns = forecast_df["Carry Return"].values
-    total_returns = forecast_df["Expected Total Return"].values
+    # Center scores so high return currencies become long,
+    # low return currencies become short
+    raw_weights = scores - np.mean(scores)
+
+    if np.all(np.abs(raw_weights) < 1e-12):
+        weights = np.zeros(len(scores))
+    else:
+        weights = raw_weights / np.max(np.abs(raw_weights)) * POSITION_LIMIT
+
+    # Force sum to zero
+    weights = weights - weights.mean()
+
+    # Reapply max allocation limit
+    max_abs = np.max(np.abs(weights))
+    if max_abs > POSITION_LIMIT:
+        weights = weights / max_abs * POSITION_LIMIT
+
+    weights = weights - weights.mean()
+
+    fx_returns = df["Predicted FX Return"].values
+    carry_returns = df["Carry Return"].values
+    total_returns = df["Expected Total Return"].values
 
     fx_contribution = float(np.dot(weights, fx_returns))
     carry_contribution = float(np.dot(weights, carry_returns))
@@ -346,14 +360,18 @@ def run_ppo_allocation(forecast_df, latest_feature_map, ppo_model):
 
     sharpe = 0.0 if risk <= 1e-12 else float((total_return / risk) * np.sqrt(12))
 
-    result = forecast_df.copy()
-    result["PPO Weight"] = weights
-    result["Position Type"] = np.where(result["PPO Weight"] > 0, "Invest / Long", "Borrow / Short")
-    result["FX Contribution"] = weights * fx_returns
-    result["Carry Contribution"] = weights * carry_returns
-    result["Total Contribution"] = weights * total_returns
+    df["PPO Weight"] = weights
+    df["Position Type"] = np.where(
+        df["PPO Weight"] > 0,
+        "Invest / Long",
+        np.where(df["PPO Weight"] < 0, "Borrow / Short", "Neutral")
+    )
 
-    return result, total_return, risk, sharpe, fx_contribution, carry_contribution
+    df["FX Contribution"] = weights * fx_returns
+    df["Carry Contribution"] = weights * carry_returns
+    df["Total Contribution"] = weights * total_returns
+
+    return df, total_return, risk, sharpe, fx_contribution, carry_contribution
 
 
 def format_percent_columns(df, cols):
