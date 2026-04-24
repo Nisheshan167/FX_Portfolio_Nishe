@@ -35,8 +35,6 @@ TICKERS = {
     "CNY": "CNY=X",
 }
 
-# Default annual interest rates
-# Update these when needed
 DEFAULT_USD_RATE = 0.0525
 
 DEFAULT_FOREIGN_RATES = {
@@ -68,22 +66,20 @@ FEATURE_COLUMNS = [
 ]
 
 LOOKBACK_DAYS = 180
-PPO_STATE_SIZE = 85
+POSITION_LIMIT = 0.9
 
 PPO_MODEL_PATH = "ppo_fx_final_model_sharpe.zip"
 LSTM_BUNDLE_PATH = "lstm_fx_models_bundle.zip"
 
 
 # =====================================================
-# LOAD MODELS
+# MODEL LOADING
 # =====================================================
 
 @st.cache_resource
 def extract_lstm_bundle():
     extract_dir = os.path.join(tempfile.gettempdir(), "lstm_fx_models")
-
-    if not os.path.exists(extract_dir):
-        os.makedirs(extract_dir, exist_ok=True)
+    os.makedirs(extract_dir, exist_ok=True)
 
     with zipfile.ZipFile(LSTM_BUNDLE_PATH, "r") as zip_ref:
         zip_ref.extractall(extract_dir)
@@ -92,7 +88,7 @@ def extract_lstm_bundle():
 
 
 def find_file(root_dir, currency, extension):
-    for root, dirs, files in os.walk(root_dir):
+    for root, _, files in os.walk(root_dir):
         for file in files:
             file_lower = file.lower()
             if currency.lower() in file_lower and file_lower.endswith(extension):
@@ -140,24 +136,20 @@ def download_fx_data(ticker):
     )
 
     if data.empty:
-        raise ValueError(f"No FX data downloaded for {ticker}")
+        raise ValueError(f"No data downloaded for {ticker}")
 
     if isinstance(data.columns, pd.MultiIndex):
         close = data["Close"].iloc[:, 0]
     else:
         close = data["Close"]
 
-    df = pd.DataFrame({"close": close})
-    df = df.dropna()
-
-    return df
+    return pd.DataFrame({"close": close}).dropna()
 
 
 def build_lstm_features(df):
     df = df.copy()
 
     df["log_close"] = np.log(df["close"])
-
     df["ret_1d"] = df["close"].pct_change(1)
     df["ret_5d"] = df["close"].pct_change(5)
     df["ret_21d"] = df["close"].pct_change(21)
@@ -177,38 +169,41 @@ def build_lstm_features(df):
     df["price_vs_ma63"] = df["close"] / df["ma_63"] - 1
     df["ma21_vs_ma63"] = df["ma_21"] / df["ma_63"] - 1
 
-    df = df.dropna()
-
-    return df[FEATURE_COLUMNS]
+    return df.dropna()[FEATURE_COLUMNS]
 
 
 def predict_lstm_return(currency, features, models, scalers):
     latest_window = features.tail(LOOKBACK_DAYS)
 
     if len(latest_window) < LOOKBACK_DAYS:
-        raise ValueError(f"Not enough data for {currency}")
+        raise ValueError(f"Not enough LSTM data for {currency}")
 
-    scaler = scalers[currency]
-    model = models[currency]
-
-    scaled_window = scaler.transform(latest_window)
+    scaled_window = scalers[currency].transform(latest_window)
     X = np.expand_dims(scaled_window, axis=0)
 
-    prediction = model.predict(X, verbose=0)
+    prediction = models[currency].predict(X, verbose=0)
 
     return float(prediction.flatten()[0])
 
 
 # =====================================================
-# FINANCE FUNCTIONS
+# PPO-MATCHING FUNCTIONS
 # =====================================================
 
-def calculate_carry_return(foreign_rate, usd_rate):
-    """
-    Monthly carry based on interest rate differential.
+def action_to_weights(action, position_limit=0.9):
+    weights = np.clip(action, -1.0, 1.0).astype(np.float64)
+    weights = weights * position_limit
 
-    This MUST match PPO training.
-    """
+    for _ in range(50):
+        weights = weights - weights.mean()
+        weights = np.clip(weights, -position_limit, position_limit)
+
+    weights = weights - weights.mean()
+
+    return weights.astype(np.float32)
+
+
+def calculate_carry_return(foreign_rate, usd_rate):
     annual_rate_diff = foreign_rate - usd_rate
     monthly_carry = annual_rate_diff / 12
     return annual_rate_diff, monthly_carry
@@ -216,6 +211,8 @@ def calculate_carry_return(foreign_rate, usd_rate):
 
 def build_forecast_table(usd_rate, foreign_rates, lstm_models, lstm_scalers):
     rows = []
+
+    latest_feature_map = {}
 
     for currency in CURRENCIES:
         raw_df = download_fx_data(TICKERS[currency])
@@ -232,9 +229,14 @@ def build_forecast_table(usd_rate, foreign_rates, lstm_models, lstm_scalers):
         volatility_21d = float(features["vol_21"].iloc[-1])
         momentum_21d = float(features["mom_21"].iloc[-1])
 
-        annual_rate_diff = foreign_rates[currency] - usd_rate
-        carry_return = annual_rate_diff / 12
+        annual_rate_diff, carry_return = calculate_carry_return(
+            foreign_rates[currency],
+            usd_rate
+        )
+
         expected_total_return = predicted_fx_return + carry_return
+
+        latest_feature_map[currency] = features.iloc[-1].to_dict()
 
         rows.append({
             "Currency": currency,
@@ -250,110 +252,108 @@ def build_forecast_table(usd_rate, foreign_rates, lstm_models, lstm_scalers):
             "Momentum 21D": momentum_21d,
         })
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), latest_feature_map
 
 
-def build_ppo_state(df):
-    predicted_fx = df["Predicted FX Return"].values
-    carry = df["Carry Return"].values
-    total = df["Expected Total Return"].values
-    vol = df["Volatility 21D"].values
-    momentum = df["Momentum 21D"].values
-    spot = df["Current FX Rate"].values
-    rate_diff = df["Annual Rate Differential"].values
-
-    risk_adjusted = total / (vol + 1e-8)
-
-    state = np.concatenate([
-        predicted_fx,
-        carry,
-        total,
-        vol,
-        momentum,
-        spot,
-        rate_diff,
-        risk_adjusted,
-    ]).astype(np.float32)
-
-    if len(state) < PPO_STATE_SIZE:
-        state = np.pad(state, (0, PPO_STATE_SIZE - len(state)), constant_values=0)
-
-    if len(state) > PPO_STATE_SIZE:
-        state = state[:PPO_STATE_SIZE]
-
-    return state
-
-
-def action_to_weights(action, max_alloc=0.9):
+def build_state_features(forecast_df, latest_feature_map):
     """
-    Converts PPO action into FX long-short weights.
+    Recreates PPO-style STATE_FEATURES using latest available market features.
 
-    Positive weight = invest / long currency
-    Negative weight = borrow / short currency
+    Training used:
+    obs = concatenate([feature_values, prev_weights])
 
-    Constraints:
-    - weights sum to 0
-    - max absolute allocation per currency = 0.9
+    This app builds feature_values from:
+    - LSTM-predicted FX returns
+    - rate differentials
+    - current technical features
     """
 
-    action = np.array(action).flatten().astype(float)
+    feature_values = []
 
-    # Clip each currency to max allocation limit
-    weights = np.clip(action, -max_alloc, max_alloc)
+    for currency in CURRENCIES:
+        tech = latest_feature_map[currency]
 
-    # Force dollar neutrality: sum(weights) = 0
-    weights = weights - weights.mean()
+        # LSTM forecast replaces target-like next-month FX signal
+        feature_values.append(forecast_df.loc[forecast_df["Currency"] == currency, "Predicted FX Return"].iloc[0])
 
-    # Re-apply max allocation rule after demeaning
-    max_abs = np.max(np.abs(weights))
+        # Carry/rate-diff feature
+        feature_values.append(forecast_df.loc[forecast_df["Currency"] == currency, "Annual Rate Differential"].iloc[0] * 100)
 
-    if max_abs > max_alloc:
-        weights = weights / max_abs * max_alloc
+        # Technical features
+        for col in FEATURE_COLUMNS:
+            feature_values.append(float(tech[col]))
 
-    # Final tiny correction for numerical precision
-    weights = weights - weights.mean()
-
-    return weights
+    return np.array(feature_values, dtype=np.float32)
 
 
-def portfolio_metrics(weights, expected_returns, volatilities):
-    """
-    Long-short FX portfolio return.
+def build_ppo_observation(forecast_df, latest_feature_map, prev_weights=None, expected_obs_dim=None):
+    feature_values = build_state_features(forecast_df, latest_feature_map)
 
-    Positive weights earn returns.
-    Negative weights represent borrowed currencies.
-    """
+    if prev_weights is None:
+        prev_weights = np.zeros(len(CURRENCIES), dtype=np.float32)
 
+    obs = np.concatenate([feature_values, prev_weights]).astype(np.float32)
+
+    if expected_obs_dim is not None:
+        if len(obs) < expected_obs_dim:
+            obs = np.pad(obs, (0, expected_obs_dim - len(obs)), constant_values=0)
+        elif len(obs) > expected_obs_dim:
+            obs = obs[:expected_obs_dim]
+
+    return obs
+
+
+def portfolio_metrics(weights, expected_returns):
     portfolio_return = float(np.dot(weights, expected_returns))
 
-    portfolio_risk = float(
-        np.sqrt(np.dot(weights ** 2, volatilities ** 2))
-    )
+    # One-period risk proxy based on dispersion of weighted asset returns
+    weighted_asset_returns = weights * expected_returns
+    portfolio_risk = float(np.std(weighted_asset_returns))
 
-    sharpe = portfolio_return / portfolio_risk if portfolio_risk != 0 else 0
+    if portfolio_risk <= 1e-12:
+        sharpe = 0.0
+    else:
+        sharpe = float((portfolio_return / portfolio_risk) * np.sqrt(12))
+
+    fx_contribution = float(np.dot(weights, expected_returns["fx"])) if isinstance(expected_returns, dict) else None
 
     return portfolio_return, portfolio_risk, sharpe
 
 
-def run_ppo_allocation(df, ppo_model):
-    state = build_ppo_state(df)
-    action, _ = ppo_model.predict(state, deterministic=True)
+def run_ppo_allocation(forecast_df, latest_feature_map, ppo_model):
+    expected_obs_dim = int(ppo_model.observation_space.shape[0])
 
-    weights = action_to_weights(action)
-
-    expected_returns = df["Expected Total Return"].values
-    volatilities = df["Volatility 21D"].values
-
-    port_return, port_risk, sharpe = portfolio_metrics(
-        weights,
-        expected_returns,
-        volatilities
+    obs = build_ppo_observation(
+        forecast_df=forecast_df,
+        latest_feature_map=latest_feature_map,
+        prev_weights=np.zeros(len(CURRENCIES), dtype=np.float32),
+        expected_obs_dim=expected_obs_dim
     )
 
-    result = df.copy()
-    result["PPO Weight"] = weights
+    action, _ = ppo_model.predict(obs, deterministic=True)
+    weights = action_to_weights(action, position_limit=POSITION_LIMIT)
 
-    return result, port_return, port_risk, sharpe
+    fx_returns = forecast_df["Predicted FX Return"].values
+    carry_returns = forecast_df["Carry Return"].values
+    total_returns = forecast_df["Expected Total Return"].values
+
+    fx_contribution = float(np.dot(weights, fx_returns))
+    carry_contribution = float(np.dot(weights, carry_returns))
+    total_return = fx_contribution + carry_contribution
+
+    weighted_total = weights * total_returns
+    risk = float(np.std(weighted_total))
+
+    sharpe = 0.0 if risk <= 1e-12 else float((total_return / risk) * np.sqrt(12))
+
+    result = forecast_df.copy()
+    result["PPO Weight"] = weights
+    result["Position Type"] = np.where(result["PPO Weight"] > 0, "Invest / Long", "Borrow / Short")
+    result["FX Contribution"] = weights * fx_returns
+    result["Carry Contribution"] = weights * carry_returns
+    result["Total Contribution"] = weights * total_returns
+
+    return result, total_return, risk, sharpe, fx_contribution, carry_contribution
 
 
 def format_percent_columns(df, cols):
@@ -364,31 +364,35 @@ def format_percent_columns(df, cols):
 
 
 # =====================================================
-# APP
+# APP UI
 # =====================================================
 
 st.title("FX Portfolio Optimisation using LSTM Forecasting + PPO")
 
 st.write(
-    "The app predicts next 1-month FX returns using LSTM models, calculates carry return from interest-rate differentials, "
-    "and feeds the combined expected return into a trained PPO model to generate optimal currency weights."
+    "This app predicts next 1-month FX returns using LSTM models, adds monthly carry from interest-rate differentials, "
+    "and passes the resulting state into a trained PPO model that was trained to maximise rolling Sharpe ratio."
 )
 
 try:
     ppo_model = load_ppo_model()
     lstm_models, lstm_scalers = load_lstm_models()
 
-    live_df = build_forecast_table(
+    live_df, live_feature_map = build_forecast_table(
         usd_rate=DEFAULT_USD_RATE,
         foreign_rates=DEFAULT_FOREIGN_RATES,
         lstm_models=lstm_models,
         lstm_scalers=lstm_scalers
     )
 
-    live_result, live_return, live_risk, live_sharpe = run_ppo_allocation(
-        live_df,
-        ppo_model
-    )
+    (
+        live_result,
+        live_return,
+        live_risk,
+        live_sharpe,
+        live_fx_contribution,
+        live_carry_contribution
+    ) = run_ppo_allocation(live_df, live_feature_map, ppo_model)
 
     tab1, tab2, tab3 = st.tabs([
         "Live FX Forecast",
@@ -396,19 +400,15 @@ try:
         "Simulation"
     ])
 
-    # =====================================================
-    # TAB 1: LIVE FORECAST
-    # =====================================================
-
     with tab1:
-        st.subheader("Live LSTM FX Forecast + Carry Return")
+        st.subheader("Live LSTM FX Forecast + Carry")
 
         st.info(
-            "Live mode uses default interest-rate assumptions inside the app. "
-            "Rate editing is only available in the Simulation tab."
+            "Live mode uses default interest-rate assumptions. "
+            "Only the Simulation tab allows rate changes."
         )
 
-        display_cols = [
+        display_df = live_df[[
             "Currency",
             "Current FX Rate",
             "Foreign Interest Rate",
@@ -418,9 +418,7 @@ try:
             "Carry Return",
             "Expected Total Return",
             "Volatility 21D",
-        ]
-
-        display_df = live_df[display_cols]
+        ]]
 
         display_df = format_percent_columns(
             display_df,
@@ -437,25 +435,29 @@ try:
 
         st.dataframe(display_df, use_container_width=True)
 
-    # =====================================================
-    # TAB 2: PPO PORTFOLIO
-    # =====================================================
-
     with tab2:
-        st.subheader("PPO Optimal Portfolio Allocation")
+        st.subheader("PPO Long-Short Portfolio Allocation")
 
         col1, col2, col3 = st.columns(3)
         col1.metric("Expected 1-Month Portfolio Return", f"{live_return:.2%}")
-        col2.metric("Portfolio Risk", f"{live_risk:.2%}")
+        col2.metric("Risk Proxy", f"{live_risk:.2%}")
         col3.metric("Sharpe Ratio", f"{live_sharpe:.2f}")
+
+        col4, col5, col6 = st.columns(3)
+        col4.metric("FX Contribution", f"{live_fx_contribution:.2%}")
+        col5.metric("Carry Contribution", f"{live_carry_contribution:.2%}")
+        col6.metric("Weight Sum", f"{live_result['PPO Weight'].sum():.4f}")
 
         portfolio_df = live_result[[
             "Currency",
+            "Position Type",
             "Predicted FX Return",
             "Carry Return",
             "Expected Total Return",
-            "Volatility 21D",
-            "PPO Weight"
+            "PPO Weight",
+            "FX Contribution",
+            "Carry Contribution",
+            "Total Contribution",
         ]]
 
         portfolio_df = format_percent_columns(
@@ -464,28 +466,19 @@ try:
                 "Predicted FX Return",
                 "Carry Return",
                 "Expected Total Return",
-                "Volatility 21D",
                 "PPO Weight",
+                "FX Contribution",
+                "Carry Contribution",
+                "Total Contribution",
             ]
         )
 
         st.dataframe(portfolio_df, use_container_width=True)
 
-        chart_df = live_result[["Currency", "PPO Weight"]].set_index("Currency")
-        st.bar_chart(chart_df)
-
-    # =====================================================
-    # TAB 3: SIMULATION
-    # =====================================================
+        st.bar_chart(live_result[["Currency", "PPO Weight"]].set_index("Currency"))
 
     with tab3:
-        st.subheader("Simulation: Change Interest Rates and Recalculate Portfolio")
-
-        st.write(
-            "Here, you can change the USD and foreign interest rates. "
-            "The app recalculates the carry return, combines it with the LSTM FX forecast, "
-            "and sends the updated state into the PPO model."
-        )
+        st.subheader("Simulation: Change Interest Rates")
 
         sim_usd_rate = st.number_input(
             "USD Interest Rate",
@@ -495,7 +488,6 @@ try:
         )
 
         sim_foreign_rates = {}
-
         cols = st.columns(3)
 
         for i, currency in enumerate(CURRENCIES):
@@ -507,35 +499,45 @@ try:
                     format="%.4f"
                 )
 
-        sim_df = build_forecast_table(
+        sim_df, sim_feature_map = build_forecast_table(
             usd_rate=sim_usd_rate,
             foreign_rates=sim_foreign_rates,
             lstm_models=lstm_models,
             lstm_scalers=lstm_scalers
         )
 
-        sim_result, sim_return, sim_risk, sim_sharpe = run_ppo_allocation(
-            sim_df,
-            ppo_model
-        )
+        (
+            sim_result,
+            sim_return,
+            sim_risk,
+            sim_sharpe,
+            sim_fx_contribution,
+            sim_carry_contribution
+        ) = run_ppo_allocation(sim_df, sim_feature_map, ppo_model)
 
         st.divider()
 
         col1, col2, col3 = st.columns(3)
         col1.metric("Simulated 1-Month Portfolio Return", f"{sim_return:.2%}")
-        col2.metric("Simulated Portfolio Risk", f"{sim_risk:.2%}")
-        col3.metric("Simulated Sharpe Ratio", f"{sim_sharpe:.2f}")
+        col2.metric("Risk Proxy", f"{sim_risk:.2%}")
+        col3.metric("Sharpe Ratio", f"{sim_sharpe:.2f}")
+
+        col4, col5, col6 = st.columns(3)
+        col4.metric("FX Contribution", f"{sim_fx_contribution:.2%}")
+        col5.metric("Carry Contribution", f"{sim_carry_contribution:.2%}")
+        col6.metric("Weight Sum", f"{sim_result['PPO Weight'].sum():.4f}")
 
         sim_display = sim_result[[
             "Currency",
+            "Position Type",
             "Foreign Interest Rate",
             "USD Interest Rate",
             "Annual Rate Differential",
             "Predicted FX Return",
             "Carry Return",
             "Expected Total Return",
-            "Volatility 21D",
-            "PPO Weight"
+            "PPO Weight",
+            "Total Contribution",
         ]]
 
         sim_display = format_percent_columns(
@@ -547,15 +549,14 @@ try:
                 "Predicted FX Return",
                 "Carry Return",
                 "Expected Total Return",
-                "Volatility 21D",
                 "PPO Weight",
+                "Total Contribution",
             ]
         )
 
         st.dataframe(sim_display, use_container_width=True)
 
-        sim_chart_df = sim_result[["Currency", "PPO Weight"]].set_index("Currency")
-        st.bar_chart(sim_chart_df)
+        st.bar_chart(sim_result[["Currency", "PPO Weight"]].set_index("Currency"))
 
 except Exception as e:
     st.error("App failed to run.")
