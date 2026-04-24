@@ -166,7 +166,7 @@ def load_lstm_assets():
 
         try:
             model = tf.keras.models.load_model(model_path)
-            scaler = joblib.load(scaler_path) if scaler_path else None
+            scaler = None
             metadata = load_json_file(meta_path)
             assets[ccy] = {
                 "model": model,
@@ -266,10 +266,19 @@ def prepare_keras_sequence(ccy: str, close: pd.Series, assets: dict):
     feature_cols = choose_feature_columns(feature_frame, metadata)
     X = feature_frame[feature_cols].copy()
 
-    if scaler is not None:
-        X_scaled = scaler.transform(X)
-    else:
-        X_scaled = X.values
+    from sklearn.preprocessing import StandardScaler
+
+def prepare_keras_sequence(ccy: str, close: pd.Series, assets: dict):
+    asset = assets[ccy]
+    metadata = asset["metadata"]
+    lookback = int(metadata.get("lookback_days", metadata.get("lookback", LOOKBACK_DEFAULT)))
+
+    feature_frame = build_features_from_close(close)
+    feature_cols = choose_feature_columns(feature_frame, metadata)
+    X = feature_frame[feature_cols].copy()
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
 
     if len(X_scaled) < lookback:
         raise ValueError(f"Not enough rows for {ccy}. Need at least {lookback}, got {len(X_scaled)}")
