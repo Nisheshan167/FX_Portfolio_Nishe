@@ -203,10 +203,12 @@ def predict_lstm_return(currency, features, models, scalers):
 # FINANCE FUNCTIONS
 # =====================================================
 
-def calculate_carry_return(foreign_rate, usd_rate):
-    annual_rate_diff = foreign_rate - usd_rate
-    monthly_carry = annual_rate_diff / 12
-    return annual_rate_diff, monthly_carry
+def calculate_carry_return(foreign_rate):
+    """
+    Monthly carry earned by holding that currency.
+    PPO weight sign decides whether we invest or borrow.
+    """
+    return foreign_rate / 12
 
 
 def build_forecast_table(usd_rate, foreign_rates, lstm_models, lstm_scalers):
@@ -227,11 +229,7 @@ def build_forecast_table(usd_rate, foreign_rates, lstm_models, lstm_scalers):
         volatility_21d = float(features["vol_21"].iloc[-1])
         momentum_21d = float(features["mom_21"].iloc[-1])
 
-        annual_rate_diff, carry_return = calculate_carry_return(
-            foreign_rates[currency],
-            usd_rate
-        )
-
+        carry_return = calculate_carry_return(foreign_rates[currency])
         expected_total_return = predicted_fx_return + carry_return
 
         rows.append({
@@ -282,18 +280,52 @@ def build_ppo_state(df):
     return state
 
 
-def action_to_weights(action):
-    action = np.array(action).flatten()
+def action_to_weights(action, max_alloc=0.9):
+    """
+    Converts PPO action into FX long-short weights.
 
-    exp_action = np.exp(action - np.max(action))
-    weights = exp_action / exp_action.sum()
+    Positive weight = invest / long currency
+    Negative weight = borrow / short currency
+
+    Constraints:
+    - weights sum to 0
+    - max absolute allocation per currency = 0.9
+    """
+
+    action = np.array(action).flatten().astype(float)
+
+    # Clip each currency to max allocation limit
+    weights = np.clip(action, -max_alloc, max_alloc)
+
+    # Force dollar neutrality: sum(weights) = 0
+    weights = weights - weights.mean()
+
+    # Re-apply max allocation rule after demeaning
+    max_abs = np.max(np.abs(weights))
+
+    if max_abs > max_alloc:
+        weights = weights / max_abs * max_alloc
+
+    # Final tiny correction for numerical precision
+    weights = weights - weights.mean()
 
     return weights
 
 
 def portfolio_metrics(weights, expected_returns, volatilities):
+    """
+    Long-short FX portfolio return.
+
+    Positive weights earn returns.
+    Negative weights represent borrowed currencies.
+    """
+
     portfolio_return = float(np.dot(weights, expected_returns))
-    portfolio_risk = float(np.sqrt(np.dot(weights ** 2, volatilities ** 2)))
+
+    portfolio_risk = float(
+        np.sqrt(np.dot(weights ** 2, volatilities ** 2))
+    )
+
     sharpe = portfolio_return / portfolio_risk if portfolio_risk != 0 else 0
 
     return portfolio_return, portfolio_risk, sharpe
