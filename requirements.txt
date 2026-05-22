@@ -1,11 +1,10 @@
 streamlit
+numpy==1.26.4
 pandas
-numpy==2.0.2
 scikit-learn
-tensorflow-cpu=2.16.1
-torch
-stable-baselines3==2.8.0
-gymnasium==1.2.3
-yfinance
 matplotlib
+yfinance
 joblib
+tensorflow==2.16.1
+stable-baselines3
+gymnasium
