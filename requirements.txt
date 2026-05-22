@@ -2,7 +2,7 @@ streamlit
 pandas
 numpy==2.0.2
 scikit-learn
-tensorflow-cpu
+tensorflow-cpu=2.16.1
 torch
 stable-baselines3==2.8.0
 gymnasium==1.2.3
