@@ -393,7 +393,7 @@ st.write(
 )
 
 try:
-    ppo_model = load_ppo_model()
+    return PPO.load(PPO_MODEL_PATH, device="cpu")
     lstm_models, lstm_scalers = load_lstm_models()
 
     live_df, live_feature_map = build_forecast_table(
