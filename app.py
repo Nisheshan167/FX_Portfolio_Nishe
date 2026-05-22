@@ -116,7 +116,8 @@ def load_lstm_models():
 
 @st.cache_resource
 def load_ppo_model():
-    return PPO.load(PPO_MODEL_PATH)
+    PPO_MODEL_PATH = "ppo_fx_final_model_sharpe.zip"
+    return PPO.load(PPO_MODEL_PATH, device="cpu")
 
 
 # =====================================================
